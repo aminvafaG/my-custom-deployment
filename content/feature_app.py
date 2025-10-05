@@ -1,123 +1,254 @@
-# content/feature_app.py — lazy-imports so NumPy/Pandas/Matplotlib load after the kernel is ready
-from __future__ import annotations
-import io
-import ipywidgets as W  # pure-Python, safe to import at module level
+# content/feature_app.py — JupyterLite-friendly dashboard (no-code view in notebook)
+# Filters by numeric features and optional 'layer'; overlays population, mean, and a selected unit
+# Plots orientation tuning + PSTH; shows selected unit's feature row.
+# Works with: content/data/meta.csv, tuning_curves.npz, psth.npz
 
-# We'll attach these globals after lazy-importing
+from __future__ import annotations
+import io, math
+import ipywidgets as W
+
+# Lazy imports so importing this module never fails on cold kernels
 np = None
 pd = None
 plt = None
 
 def _lazy_imports():
-    """Import heavy libs only when needed (after kernel has loaded them)."""
     global np, pd, plt
-    if np is not None and pd is not None and plt is not None:
+    if np is not None:
         return
     import importlib
     np  = importlib.import_module("numpy")
     pd  = importlib.import_module("pandas")
     plt = importlib.import_module("matplotlib.pyplot")
 
-def _load_meta() -> tuple["pd.DataFrame", str]:
+# ---- data loading ----
+_DATA_PATHS = (
+    ("content/data/meta.csv", "content/data/tuning_curves.npz", "content/data/psth.npz"),
+    ("data/meta.csv",         "data/tuning_curves.npz",         "data/psth.npz"),
+    ("/files/data/meta.csv",  "/files/data/tuning_curves.npz",  "/files/data/psth.npz"),
+    ("/drive/data/meta.csv",  "/drive/data/tuning_curves.npz",  "/drive/data/psth.npz"),
+)
+
+def _load_all():
     _lazy_imports()
-    for p in ("data/meta.csv","content/data/meta.csv","/files/data/meta.csv","/drive/data/meta.csv"):
+    last_err = None
+    for meta_p, tc_p, psth_p in _DATA_PATHS:
         try:
-            return pd.read_csv(p), p
-        except Exception:
-            pass
-    raise RuntimeError("meta.csv not found in expected locations.")
+            df = pd.read_csv(meta_p)
+            tc = np.load(tc_p, allow_pickle=True)
+            psth = np.load(psth_p, allow_pickle=True)
+            angles = np.asarray(tc["angles"])
+            tc_curves = np.asarray(tc["curves"])
+            t = np.asarray(psth["t"])
+            psth_curves = np.asarray(psth["curves"])
+            return (df, meta_p), (angles, tc_curves, tc_p), (t, psth_curves, psth_p)
+        except Exception as e:
+            last_err = e
+    raise RuntimeError(f"Could not load data from known paths. Last error: {last_err!r}")
 
-def _unit_col(df) -> str | None:
-    return next((c for c in ("unit","unit_id","Unit","id","neuron_id") if c in df.columns), None)
+def _unit_col(df) -> str:
+    for c in ("unit_id","unit","id","neuron_id","Unit","Unit_id"):
+        if c in df.columns: return c
+    return ""
 
-def _numeric_cols(df, exclude: str | None) -> list[str]:
+def _numeric_feature_columns(df, exclude_cols=()):
     _lazy_imports()
-    cols = []
+    numeric_cols = []
     for c in df.columns:
-        if c == exclude:
+        if c in exclude_cols: 
             continue
         s = pd.to_numeric(df[c], errors="coerce")
         if s.notna().mean() >= 0.95:
             df[c] = s
-            cols.append(c)
-    return cols
+            numeric_cols.append(c)
+    return numeric_cols
 
-def _detect_features(df_in):
-    _lazy_imports()
-    df = df_in.copy()
-    unit = _unit_col(df)
-    preferred = [
-        ["feature1","feature2","feature3"],
-        ["Feature1","Feature2","Feature3"],
-        ["feature_1","feature_2","feature_3"],
-        ["feat1","feat2","feat3"],
-        ["F1","F2","F3"],
-    ]
-    for cols in preferred:
-        if all(c in df.columns for c in cols):
-            for c in cols: df[c] = pd.to_numeric(df[c], errors="coerce")
-            return df, unit, cols, [f"Using preferred columns: {', '.join(cols)}"]
-
-    nums = _numeric_cols(df, unit)
-    notes: list[str] = []
-    if len(nums) >= 3:
-        return df, unit, nums[:3], ["Using first three numeric columns."]
-    if len(nums) == 2:
-        a, b = nums
-        f3 = f"feature3_mean({a},{b})"
-        df[f3] = (df[a] + df[b]) / 2
-        return df, unit, [a, b, f3], [f"Added {f3}."]
-    if len(nums) == 1:
-        a = nums[0]; s = df[a]
-        std = float(s.std(ddof=0)) or 1.0
-        rng = float(s.max() - s.min()) or 1.0
-        f2 = f"feature2_z({a})"; f3 = f"feature3_minmax({a})"
-        df[f2] = (s - float(s.mean())) / std
-        df[f3] = (s - float(s.min())) / rng
-        return df, unit, [a, f2, f3], [f"Added {f2} and {f3}."]
-
-    n = len(df)
-    df["feature1_index"] = np.arange(n)
-    df["feature2_sqrt"]  = np.sqrt(np.arange(n))
-    df["feature3_sin"]   = np.sin(np.arange(n))
-    return df, unit, ["feature1_index","feature2_sqrt","feature3_sin"], ["No numeric columns; generated features."]
-
-def _fig_png(df, cols: list[str], feature_idx: int, unit: str | None) -> bytes:
-    _lazy_imports()
-    idx = int(feature_idx) - 1
-    if not (0 <= idx < len(cols)):
-        raise IndexError(f"feature index {feature_idx} out of range 1..{len(cols)}")
-    col = cols[idx]
-    y = df[col].to_numpy()
-    x = np.arange(len(y))
-
-    fig, ax = plt.subplots(figsize=(7.2, 4.5))
-    ax.plot(x, y, marker="o", linestyle="-")
-    ax.set_title(f"{col} across all units (n={len(y)})")
-    ax.set_xlabel(unit if unit else "Unit index")
-    ax.set_ylabel(col)
-    ax.grid(True, alpha=0.3)
-    fig.tight_layout()
+# ---- plotting ----
+def _to_png(fig, dpi=144):
     buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=150, bbox_inches="tight")
+    fig.savefig(buf, format="png", dpi=dpi, bbox_inches="tight")
     plt.close(fig)
     return buf.getvalue()
 
+def _plot_tuning(angles, tc_curves, idxs, highlight_idx=None):
+    _lazy_imports()
+    fig, ax = plt.subplots(figsize=(7.5, 4.5))
+    if len(idxs):
+        for i in idxs:
+            ax.plot(angles, tc_curves[i], lw=0.8, alpha=0.20)
+        ax.plot(angles, tc_curves[idxs].mean(axis=0), lw=2.5)
+    if highlight_idx is not None and 0 <= highlight_idx < tc_curves.shape[0]:
+        ax.plot(angles, tc_curves[highlight_idx], lw=3.2)
+    ax.set_title("Orientation tuning")
+    ax.set_xlabel("Orientation (deg)")
+    ax.set_ylabel("Response (a.u.)")
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    return _to_png(fig)
+
+def _plot_psth(t, psth_curves, idxs, highlight_idx=None):
+    _lazy_imports()
+    fig, ax = plt.subplots(figsize=(7.5, 4.5))
+    if len(idxs):
+        for i in idxs:
+            ax.plot(t, psth_curves[i], lw=0.8, alpha=0.20)
+        ax.plot(t, psth_curves[idxs].mean(axis=0), lw=2.5)
+    if highlight_idx is not None and 0 <= highlight_idx < psth_curves.shape[0]:
+        ax.plot(t, psth_curves[highlight_idx], lw=3.2)
+    ax.set_title("PSTH")
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("Firing rate (sp/s)")
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    return _to_png(fig)
+
+# ---- UI app ----
 def build_app():
     _lazy_imports()
-    df_raw, path = _load_meta()
-    df, unit, cols, notes = _detect_features(df_raw)
-    info = W.HTML(
-        f"<b>Loaded:</b> <code>{path}</code><br>"
-        f"<b>Features:</b> {', '.join(cols)}<br>"
-        f"<small>{' '.join(notes)}</small>"
+    (df, meta_p), (angles, tc_curves, tc_p), (t, psth_curves, psth_p) = _load_all()
+    df = df.copy()
+    N = len(df)
+
+    unit_col = _unit_col(df)
+    if unit_col == "":
+        df["unit_id"] = np.arange(1, N+1)
+        unit_col = "unit_id"
+
+    # optional categorical 'layer'
+    layer_col = None
+    for c in ("layer","Layer","lamina","Lamina"):
+        if c in df.columns:
+            layer_col = c
+            break
+
+    num_cols = _numeric_feature_columns(df, exclude_cols=(unit_col, layer_col) if layer_col else (unit_col,))
+    # sliders
+    sliders = {}
+    for c in num_cols:
+        s = df[c].astype(float)
+        lo = float(np.nanmin(s))
+        hi = float(np.nanmax(s))
+        step = (hi - lo)/200.0 if math.isfinite(hi-lo) and (hi-lo) > 0 else 0.01
+        sliders[c] = W.FloatRangeSlider(
+            value=[lo, hi], min=lo, max=hi, step=step,
+            description=c, readout_format=".3f", continuous_update=False, layout=W.Layout(width="100%")
+        )
+
+    # layer filter
+    layer_ms = None
+    if layer_col:
+        layers = sorted(x for x in df[layer_col].dropna().unique().tolist())
+        layer_ms = W.SelectMultiple(options=layers, value=tuple(layers), rows=min(6, len(layers)),
+                                    description="layer")
+
+    # unit dropdown (populated on filter)
+    unit_dd = W.Dropdown(options=[("— none —", -1)], value=-1, description="unit")
+
+    # outputs
+    where_loaded = W.HTML(
+        f"<small><b>Loaded</b>: <code>{meta_p}</code>, <code>{tc_p}</code>, <code>{psth_p}</code></small>"
     )
-    slider = W.IntSlider(value=1, min=1, max=3, step=1, description="Feature", continuous_update=False)
-    img = W.Image(format="png")
-    def redraw(_=None): img.value = _fig_png(df, cols, slider.value, unit)
-    slider.observe(redraw, names="value")
-    redraw()
-    return W.VBox([info, slider, img], layout=W.Layout(width="900px"))
+    status = W.HTML()
+    tuning_img = W.Image(format="png", layout=W.Layout(width="100%"))
+    psth_img   = W.Image(format="png", layout=W.Layout(width="100%"))
+    features_html = W.HTML()
+
+    reset_btn = W.Button(description="Reset filters", icon="undo")
+
+    ctrls = []
+    if layer_ms: ctrls.append(layer_ms)
+    ctrls.extend(sliders.values())
+    controls = W.VBox([
+        W.HTML("<b>Filters</b>"),
+        *ctrls,
+        reset_btn,
+        W.HTML("<hr>"),
+        unit_dd,
+    ], layout=W.Layout(width="320px", overflow_y="auto", max_height="80vh"))
+
+    tabs = W.Tab(children=[tuning_img, psth_img, features_html])
+    tabs.set_title(0, "Tuning")
+    tabs.set_title(1, "PSTH")
+    tabs.set_title(2, "Selected unit features")
+
+    app = W.AppLayout(
+        header=where_loaded,
+        left_sidebar=controls,
+        center=tabs,
+        right_sidebar=None,
+        footer=status,
+        pane_widths=["340px", "1fr", 0],
+        pane_heights=[0, "1fr", "auto"],
+    )
+
+    def _current_mask():
+        m = np.ones(N, dtype=bool)
+        if layer_ms:
+            sel = set(layer_ms.value)
+            if sel:
+                m &= df[layer_col].isin(sel).to_numpy()
+        for c, sl in sliders.items():
+            lo, hi = sl.value
+            s = df[c].to_numpy(dtype=float)
+            m &= (s >= lo) & (s <= hi)
+        return m
+
+    def _map_uid_to_index(uid: int):
+        fast = uid - 1
+        if 0 <= fast < N and int(df.loc[fast, unit_col]) == uid:
+            return fast
+        hits = np.where(df[unit_col].to_numpy().astype(int) == uid)[0]
+        return int(hits[0]) if len(hits) else None
+
+    def _recompute(_=None):
+        mask = _current_mask()
+        idxs = np.where(mask)[0]
+        n = len(idxs)
+
+        # dropdown
+        choices = [("— none —", -1)]
+        for i in idxs:
+            uid = int(df.loc[i, unit_col])
+            lab = f"{uid}" + (f" ({df.loc[i, layer_col]})" if layer_col else "")
+            choices.append((lab, uid))
+        old = unit_dd.value
+        unit_dd.options = choices
+        unit_dd.value = old if any(v == old for _, v in choices) else -1
+
+        # highlight
+        hl_idx = None if unit_dd.value == -1 else _map_uid_to_index(int(unit_dd.value))
+
+        status.value = f"<b>Selected:</b> {n} unit(s)" + (f" • highlighted: {unit_dd.value}" if unit_dd.value != -1 else "")
+
+        tuning_img.value = _plot_tuning(angles, tc_curves, idxs, hl_idx)
+        psth_img.value   = _plot_psth(t, psth_curves, idxs, hl_idx)
+
+        if unit_dd.value != -1 and hl_idx is not None:
+            row = df.iloc[hl_idx]
+            rows = "".join(
+                f"<tr><th style='text-align:left;padding-right:8px'>{k}</th><td>{v}</td></tr>"
+                for k, v in row.items()
+            )
+            features_html.value = f"<table>{rows}</table>"
+        else:
+            features_html.value = "<i>No unit selected.</i>"
+
+    def _reset(_=None):
+        if layer_ms:
+            layer_ms.value = tuple(layer_ms.options)
+        for sl in sliders.values():
+            sl.value = (sl.min, sl.max)
+
+    # wire
+    for sl in sliders.values():
+        sl.observe(_recompute, names="value")
+    if layer_ms:
+        layer_ms.observe(_recompute, names="value")
+    unit_dd.observe(_recompute, names="value")
+    reset_btn.on_click(_reset)
+
+    _recompute()
+    return app
 
 def main():
     return build_app()
