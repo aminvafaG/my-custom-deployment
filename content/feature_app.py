@@ -177,8 +177,9 @@ def build_app():
         center=tabs,
         right_sidebar=None,
         footer=status,
-        pane_widths=["340px", "1fr", 0],
-        pane_heights=[0, "1fr", "auto"],
+        # NOTE: Use explicit px/fr values; 'auto' is not allowed here in Lite
+        pane_widths=["340px", "1fr", "0px"],
+        pane_heights=["30px", "1fr", "30px"],
     )
 
     def _current_mask():
