@@ -1,12 +1,25 @@
-# content/feature_app.py — minimal, JupyterLite/Voici-friendly widget app
+# content/feature_app.py — lazy-imports so NumPy/Pandas/Matplotlib load after the kernel is ready
 from __future__ import annotations
 import io
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-import ipywidgets as W
+import ipywidgets as W  # pure-Python, safe to import at module level
 
-def _load_meta() -> tuple[pd.DataFrame, str]:
+# We'll attach these globals after lazy-importing
+np = None
+pd = None
+plt = None
+
+def _lazy_imports():
+    """Import heavy libs only when needed (after kernel has loaded them)."""
+    global np, pd, plt
+    if np is not None and pd is not None and plt is not None:
+        return
+    import importlib
+    np  = importlib.import_module("numpy")
+    pd  = importlib.import_module("pandas")
+    plt = importlib.import_module("matplotlib.pyplot")
+
+def _load_meta() -> tuple["pd.DataFrame", str]:
+    _lazy_imports()
     for p in ("data/meta.csv","content/data/meta.csv","/files/data/meta.csv","/drive/data/meta.csv"):
         try:
             return pd.read_csv(p), p
@@ -14,13 +27,14 @@ def _load_meta() -> tuple[pd.DataFrame, str]:
             pass
     raise RuntimeError("meta.csv not found in expected locations.")
 
-def _unit_col(df: pd.DataFrame) -> str | None:
+def _unit_col(df) -> str | None:
     return next((c for c in ("unit","unit_id","Unit","id","neuron_id") if c in df.columns), None)
 
-def _numeric_cols(df: pd.DataFrame, exclude: str | None) -> list[str]:
+def _numeric_cols(df, exclude: str | None) -> list[str]:
+    _lazy_imports()
     cols = []
     for c in df.columns:
-        if c == exclude: 
+        if c == exclude:
             continue
         s = pd.to_numeric(df[c], errors="coerce")
         if s.notna().mean() >= 0.95:
@@ -28,7 +42,9 @@ def _numeric_cols(df: pd.DataFrame, exclude: str | None) -> list[str]:
             cols.append(c)
     return cols
 
-def _detect_features(df: pd.DataFrame) -> tuple[str | None, list[str], list[str]]:
+def _detect_features(df_in):
+    _lazy_imports()
+    df = df_in.copy()
     unit = _unit_col(df)
     preferred = [
         ["feature1","feature2","feature3"],
@@ -40,16 +56,17 @@ def _detect_features(df: pd.DataFrame) -> tuple[str | None, list[str], list[str]
     for cols in preferred:
         if all(c in df.columns for c in cols):
             for c in cols: df[c] = pd.to_numeric(df[c], errors="coerce")
-            return unit, cols, [f"Using preferred columns: {', '.join(cols)}"]
+            return df, unit, cols, [f"Using preferred columns: {', '.join(cols)}"]
+
     nums = _numeric_cols(df, unit)
     notes: list[str] = []
     if len(nums) >= 3:
-        return unit, nums[:3], ["Using first three numeric columns."]
+        return df, unit, nums[:3], ["Using first three numeric columns."]
     if len(nums) == 2:
         a, b = nums
         f3 = f"feature3_mean({a},{b})"
         df[f3] = (df[a] + df[b]) / 2
-        return unit, [a, b, f3], [f"Added {f3}."]
+        return df, unit, [a, b, f3], [f"Added {f3}."]
     if len(nums) == 1:
         a = nums[0]; s = df[a]
         std = float(s.std(ddof=0)) or 1.0
@@ -57,20 +74,23 @@ def _detect_features(df: pd.DataFrame) -> tuple[str | None, list[str], list[str]
         f2 = f"feature2_z({a})"; f3 = f"feature3_minmax({a})"
         df[f2] = (s - float(s.mean())) / std
         df[f3] = (s - float(s.min())) / rng
-        return unit, [a, f2, f3], [f"Added {f2} and {f3}."]
+        return df, unit, [a, f2, f3], [f"Added {f2} and {f3}."]
+
     n = len(df)
     df["feature1_index"] = np.arange(n)
     df["feature2_sqrt"]  = np.sqrt(np.arange(n))
     df["feature3_sin"]   = np.sin(np.arange(n))
-    return unit, ["feature1_index","feature2_sqrt","feature3_sin"], ["No numeric columns; generated features."]
+    return df, unit, ["feature1_index","feature2_sqrt","feature3_sin"], ["No numeric columns; generated features."]
 
-def _fig_png(df: pd.DataFrame, cols: list[str], feature_idx: int, unit: str | None) -> bytes:
+def _fig_png(df, cols: list[str], feature_idx: int, unit: str | None) -> bytes:
+    _lazy_imports()
     idx = int(feature_idx) - 1
     if not (0 <= idx < len(cols)):
         raise IndexError(f"feature index {feature_idx} out of range 1..{len(cols)}")
     col = cols[idx]
     y = df[col].to_numpy()
     x = np.arange(len(y))
+
     fig, ax = plt.subplots(figsize=(7.2, 4.5))
     ax.plot(x, y, marker="o", linestyle="-")
     ax.set_title(f"{col} across all units (n={len(y)})")
@@ -84,8 +104,9 @@ def _fig_png(df: pd.DataFrame, cols: list[str], feature_idx: int, unit: str | No
     return buf.getvalue()
 
 def build_app():
-    df, path = _load_meta()
-    unit, cols, notes = _detect_features(df)
+    _lazy_imports()
+    df_raw, path = _load_meta()
+    df, unit, cols, notes = _detect_features(df_raw)
     info = W.HTML(
         f"<b>Loaded:</b> <code>{path}</code><br>"
         f"<b>Features:</b> {', '.join(cols)}<br>"
